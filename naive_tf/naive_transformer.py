@@ -1,11 +1,11 @@
 """
-TinyPFN using Real PFN Training Setup
+Naive 1-Layer Transformer with Proper PFN Training Setup
 
-This implementation uses the actual PFN training configuration:
+This implementation uses the same proper PFN training configuration as TinyPFN:
 - FullSupportBarDistribution loss (1000 buckets)
 - Real PFN priors (GP/BNN) instead of simple ridge regression
 - Proper batch size, learning rate, etc.
-- But keeps the single layer architecture for comparison
+- But uses only standard item attention (no feature attention)
 """
 
 import sys
@@ -15,23 +15,24 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import numpy as np
 
-from pfns.model.layer import PerFeatureLayer
 from pfns.model.bar_distribution import FullSupportBarDistribution, get_bucket_borders
-from pfns import priors
 
 
-class TinyPFN(nn.Module):
+class NaiveTransformer(nn.Module):
     """
-    TinyPFN with proper PFN training setup but single layer architecture.
+    A naive 1-layer transformer with proper PFN training setup.
     
-    Key improvements:
-    1. Uses FullSupportBarDistribution loss (1000 buckets)
-    2. Uses real PFN priors (GP/BNN) for training data
-    3. Proper batch size, learning rate, etc.
-    4. Single layer architecture for comparison
+    Key differences from TinyPFN:
+    1. Only item attention (data points attending to each other)
+    2. No feature attention (features don't attend to each other)
+    3. Standard transformer architecture
+    
+    But uses proper PFN training setup:
+    - FullSupportBarDistribution loss
+    - Real PFN priors
+    - Proper batch size, learning rate
     """
     
     def __init__(
@@ -41,8 +42,6 @@ class TinyPFN(nn.Module):
         n_heads=4,
         dropout=0.1,
         max_seq_len=60,  # Match real PFN
-        n_mixture_components=3,
-        output_mode='distributional',  # Real PFNs use distributional output
         n_buckets=1000  # Real PFN uses 1000 buckets
     ):
         super().__init__()
@@ -51,24 +50,33 @@ class TinyPFN(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
-        self.n_mixture_components = n_mixture_components
-        self.output_mode = output_mode
         self.n_buckets = n_buckets
         
-        # Real PerFeatureLayer from PFN - single layer architecture
-        self.dual_attention_layer = PerFeatureLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_model * 2,  # Match real PFN ratio
-            activation="relu",
-            layer_norm_eps=1e-5,
-            attention_between_features=True,
-            zero_init=True,
-            layer_norm_with_elementwise_affine=True
+        # Input encoding - combine features and targets into single representation
+        self.feature_projection = nn.Linear(num_features, d_model)
+        self.target_projection = nn.Linear(1, d_model)
+        
+        # Standard transformer layer - only item attention
+        self.item_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
         )
         
+        # Feed-forward network
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),  # Match real PFN ratio
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model)
+        )
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
         # Create bucket borders for FullSupportBarDistribution
-        # Use a reasonable range for BNN-like targets
         bucket_borders = get_bucket_borders(
             num_outputs=n_buckets,
             full_range=(-3.0, 3.0)  # Covers typical BNN output range
@@ -108,66 +116,79 @@ class TinyPFN(nn.Module):
     
     def _forward_combined(self, x, y, train_len):
         """
-        Internal forward pass using real PFN components.
+        Internal forward pass using standard transformer architecture.
         """
         batch_size, seq_len, num_features = x.shape
         
-        # Simple encoding for single layer
-        x_encoded = self._encode_features(x)
-        y_encoded = self._encode_targets(y)
+        # Encode features and targets
+        x_encoded = self.feature_projection(x)
+        y_encoded = self.target_projection(torch.where(torch.isnan(y), torch.zeros_like(y), y))
         
-        # Combine features and targets
+        # Combine features and targets (simple addition)
         combined = x_encoded + y_encoded
         
         # Add positional encoding
-        pos_encoding = self.positional_encoding[:seq_len].unsqueeze(0).unsqueeze(2)
+        pos_encoding = self.positional_encoding[:seq_len].unsqueeze(0)
         combined = combined + pos_encoding
         
-        # Apply single dual attention layer
-        transformed = self.dual_attention_layer(
-            combined,
-            single_eval_pos=train_len
+        # Apply item attention (only data points attend to each other)
+        # Note: This is the key difference from TinyPFN - no feature attention!
+        attn_output, attention_weights = self.item_attention(
+            combined, combined, combined
         )
         
+        # Add residual connection and layer norm
+        combined = self.norm1(combined + attn_output)
+        
+        # Apply MLP
+        mlp_output = self.mlp(combined)
+        
+        # Add residual connection and layer norm
+        combined = self.norm2(combined + mlp_output)
+        
         # Extract predictions for test portion
-        test_representations = transformed[:, train_len:, 0, :]
+        test_representations = combined[:, train_len:]
         
         # Output distributional predictions
         logits = self.output_projection(test_representations)
         
         return logits
     
-    def _encode_features(self, x):
-        """Simple feature encoding."""
-        batch_size, seq_len, num_features = x.shape
-        x_flat = x.contiguous().view(-1, num_features)
-        encoded = torch.nn.functional.linear(x_flat, 
-                                           torch.randn(self.d_model, num_features).to(x.device))
-        return encoded.view(batch_size, seq_len, 1, self.d_model)
-    
-    def _encode_targets(self, y):
-        """Simple target encoding."""
-        batch_size, seq_len, _ = y.shape
-        y_clean = torch.where(torch.isnan(y), torch.zeros_like(y), y)
-        y_flat = y_clean.contiguous().view(-1, 1)
-        encoded = torch.nn.functional.linear(y_flat,
-                                           torch.randn(self.d_model, 1).to(y.device))
-        encoded = encoded.view(batch_size, seq_len, 1, self.d_model)
+    def get_attention_weights(self, x_train, y_train, x_test):
+        """
+        Get attention weights for visualization.
+        """
+        batch_size, train_len, num_features = x_train.shape
+        test_len = x_test.shape[1]
         
-        # Zero out NaN positions
-        nan_mask = torch.isnan(y).unsqueeze(-1).expand_as(encoded)
-        encoded = torch.where(nan_mask, torch.zeros_like(encoded), encoded)
+        # Combine training and test data
+        x_combined = torch.cat([x_train, x_test], dim=1)
+        y_test_placeholder = torch.full(
+            (batch_size, test_len, 1),
+            float('nan'),
+            device=x_test.device,
+            dtype=x_test.dtype
+        )
+        y_combined = torch.cat([y_train, y_test_placeholder], dim=1)
         
-        return encoded
-    
-    def get_mock_attention_weights(self, seq_len, num_features):
-        """Generate mock attention weights for visualization."""
-        feature_attn = torch.softmax(torch.randn(num_features + 1, num_features + 1), dim=-1)
-        item_attn = torch.softmax(torch.randn(seq_len, seq_len), dim=-1)
+        # Encode
+        x_encoded = self.feature_projection(x_combined)
+        y_encoded = self.target_projection(torch.where(torch.isnan(y_combined), torch.zeros_like(y_combined), y_combined))
+        combined = x_encoded + y_encoded
+        
+        # Add positional encoding
+        seq_len = combined.shape[1]
+        pos_encoding = self.positional_encoding[:seq_len].unsqueeze(0)
+        combined = combined + pos_encoding
+        
+        # Get attention weights
+        _, attention_weights = self.item_attention(
+            combined, combined, combined
+        )
         
         return {
-            'feature_attention': feature_attn,
-            'item_attention': item_attn
+            'item_attention': attention_weights[0].detach().cpu().numpy(),  # First batch
+            'feature_attention': None  # No feature attention in naive transformer
         }
     
     def predict_mean(self, logits):
@@ -230,7 +251,6 @@ def train_with_proper_pfn_setup(model, num_epochs=50, batch_size=128, learning_r
         logits = model(x_train, y_train, x_test)
         
         # Compute loss using FullSupportBarDistribution
-        # The criterion expects logits and targets directly
         loss = model.criterion(logits, y_test).mean()  # Average over batch
         
         # Backward pass
@@ -246,12 +266,12 @@ def train_with_proper_pfn_setup(model, num_epochs=50, batch_size=128, learning_r
     return losses
 
 
-def test_tiny_pfn_proper():
-    """Test TinyPFN with proper PFN training setup."""
-    print("Testing TinyPFN with proper PFN training setup...")
+def test_naive_transformer():
+    """Test the naive transformer with proper PFN training setup."""
+    print("Testing Naive Transformer with proper PFN training setup...")
     
     # Create model with proper PFN configuration
-    model = TinyPFN(num_features=18, d_model=512, n_heads=4)
+    model = NaiveTransformer(num_features=18, d_model=512, n_heads=4)
     
     # Create data using real PFN priors
     x_train, y_train, x_test, y_test = create_real_pfn_data(batch_size=4, seq_len=30)
@@ -271,8 +291,8 @@ def test_tiny_pfn_proper():
     losses = train_with_proper_pfn_setup(model, num_epochs=10, batch_size=32)
     
     print(f"Training losses: {losses}")
-    print("✓ TinyPFN proper setup test passed!")
+    print("✓ Naive Transformer proper setup test passed!")
 
 
 if __name__ == "__main__":
-    test_tiny_pfn_proper() 
+    test_naive_transformer() 
