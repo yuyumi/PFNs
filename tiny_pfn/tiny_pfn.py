@@ -3,7 +3,7 @@ TinyPFN using Real PFN Components with Attention Visualization
 
 This implementation uses the actual PFN components from the original codebase
 to create a minimal single-layer transformer that demonstrates the dual attention mechanism.
-Includes visualization of feature and item attention patterns.
+Includes visualization of feature and item attention patterns and confidence intervals.
 """
 
 import sys
@@ -23,14 +23,15 @@ from pfns.model.layer import PerFeatureLayer
 # We'll create simple mock visualizations to show what the attention patterns might look like
 
 
-class TinyPFNReal(nn.Module):
+class TinyPFN(nn.Module):
     """
-    TinyPFN using real PFN components with attention visualization.
+    TinyPFN using real PFN components with attention visualization and confidence intervals.
     
     This demonstrates the core PFN innovation using the actual implementation:
     1. Real PFN encoders for features and targets
     2. Single PerFeatureLayer implementing Feature → Item → MLP
     3. Attention visualization capabilities
+    4. Confidence interval support
     """
     
     def __init__(
@@ -39,7 +40,9 @@ class TinyPFNReal(nn.Module):
         d_model=64,
         n_heads=4,
         dropout=0.1,
-        max_seq_len=100
+        max_seq_len=100,
+        n_mixture_components=3,
+        output_mode='point'  # 'point' or 'distributional'
     ):
         super().__init__()
         
@@ -47,6 +50,8 @@ class TinyPFNReal(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.max_seq_len = max_seq_len
+        self.n_mixture_components = n_mixture_components
+        self.output_mode = output_mode
         
         # Real PerFeatureLayer from PFN - the core dual attention mechanism!
         self.dual_attention_layer = PerFeatureLayer(
@@ -60,8 +65,13 @@ class TinyPFNReal(nn.Module):
             layer_norm_with_elementwise_affine=True
         )
         
-        # Simple output projection
-        self.output_projection = nn.Linear(d_model, 1)
+        # Output projection - either point estimate or distributional
+        if output_mode == 'distributional':
+            # Outputs mixture of gaussians: weights, means, stds
+            self.output_projection = nn.Linear(d_model, n_mixture_components * 3)
+        else:
+            # Simple point estimate
+            self.output_projection = nn.Linear(d_model, 1)
         
         # Positional encoding
         self.positional_encoding = nn.Parameter(
@@ -151,6 +161,69 @@ class TinyPFNReal(nn.Module):
             'feature_attention': feature_attn,
             'item_attention': item_attn
         }
+    
+    # === Distributional Methods ===
+    
+    def get_distribution_params(self, mixture_params):
+        """Extract mixture of gaussians parameters."""
+        if self.output_mode != 'distributional':
+            raise ValueError("Model must be in distributional mode")
+            
+        batch_size, seq_len = mixture_params.shape[:2]
+        
+        # Reshape to (batch, seq, n_components, 3)
+        params = mixture_params.view(batch_size, seq_len, self.n_mixture_components, 3)
+        
+        # Extract weights, means, stds
+        weights = F.softmax(params[..., 0], dim=-1)  # Ensure weights sum to 1
+        means = params[..., 1]
+        stds = F.softplus(params[..., 2]) + 1e-6  # Ensure positive stds
+        
+        return weights, means, stds
+    
+    def mean(self, mixture_params):
+        """Compute mean of the mixture distribution."""
+        if self.output_mode != 'distributional':
+            return mixture_params  # Return as-is for point estimates
+            
+        weights, means, stds = self.get_distribution_params(mixture_params)
+        return torch.sum(weights * means, dim=-1)
+    
+    def quantile(self, mixture_params, quantiles=[0.1, 0.9]):
+        """Compute quantiles for confidence intervals."""
+        if self.output_mode != 'distributional':
+            # For point estimates, return simple std-based intervals
+            means = mixture_params
+            stds = torch.std(means, dim=-1, keepdim=True).expand_as(means) * 0.1
+            quantile_values = []
+            for q in quantiles:
+                z_score = torch.distributions.Normal(0, 1).icdf(torch.tensor(q))
+                quantile_val = means + z_score * stds
+                quantile_values.append(quantile_val)
+            return torch.stack(quantile_values, dim=-1)
+        
+        weights, means, stds = self.get_distribution_params(mixture_params)
+        
+        # Use the dominant component's quantiles
+        dominant_component = torch.argmax(weights, dim=-1)
+        
+        batch_size, seq_len = dominant_component.shape
+        
+        # Gather means and stds of dominant components
+        batch_idx = torch.arange(batch_size).unsqueeze(1).expand(-1, seq_len)
+        seq_idx = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
+        
+        dom_means = means[batch_idx, seq_idx, dominant_component]
+        dom_stds = stds[batch_idx, seq_idx, dominant_component]
+        
+        # Compute quantiles assuming normal distribution
+        quantile_values = []
+        for q in quantiles:
+            z_score = torch.distributions.Normal(0, 1).icdf(torch.tensor(q))
+            quantile_val = dom_means + z_score * dom_stds
+            quantile_values.append(quantile_val)
+        
+        return torch.stack(quantile_values, dim=-1)
 
 
 def visualize_attention_heatmaps(model, x_train, y_train, x_test, y_test):
@@ -238,7 +311,7 @@ def test_tiny_pfn_with_visualization():
     print("=" * 70)
     
     # Create model
-    model = TinyPFNReal(
+    model = TinyPFN(
         num_features=4,
         d_model=64,
         n_heads=4,

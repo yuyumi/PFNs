@@ -36,7 +36,7 @@ TinyPFN uses **exactly 1 PerFeatureLayer** from the original PFN codebase:
 
 ## Files
 
-- `tiny_pfn_real.py` - Main implementation using real PFN components
+- `tiny_pfn.py` - Main implementation using real PFN components
 - `README.md` - This documentation
 - `requirements.txt` - Dependencies
 - `__init__.py` - Package initialization
@@ -50,7 +50,7 @@ pip install -r requirements.txt
 
 ### Run the Test
 ```bash
-python tiny_pfn_real.py
+python tiny_pfn.py
 ```
 
 ### What the Test Shows
@@ -63,10 +63,10 @@ python tiny_pfn_real.py
 ## Example Usage
 
 ```python
-from tiny_pfn_real import TinyPFNReal
+from tiny_pfn import TinyPFN
 
 # Create model using real PFN components
-model = TinyPFNReal(num_features=4, d_model=64, n_heads=4)
+model = TinyPFN(num_features=4, d_model=64, n_heads=4)
 
 # Example data
 x_train = torch.randn(8, 10, 4)  # 8 batches, 10 training examples, 4 features

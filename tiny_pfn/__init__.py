@@ -6,7 +6,6 @@ This package contains a minimal implementation focusing on the core innovation:
 - Item attention: Data points attend to each other across the sequence
 """
 
-from .dual_attention import DualAttentionLayer
-from .tiny_transformer import TinyPFN
+from .tiny_pfn import TinyPFN
 
-__all__ = ["DualAttentionLayer", "TinyPFN"] 
+__all__ = ["TinyPFN"] 

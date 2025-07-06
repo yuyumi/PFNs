@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
-from tiny_pfn_real import TinyPFNReal
+from tiny_pfn import TinyPFN
 
 def get_batch_for_ridge_regression(batch_size=2, seq_len=100, num_features=1, 
                                    hyperparameters=None, device='cpu', **kwargs):
@@ -50,7 +50,7 @@ def train_tiny_pfn_on_ridge_regression(epochs=20, batch_size=16, steps_per_epoch
     print("=" * 50)
     
     # Create TinyPFN model
-    model = TinyPFNReal(
+    model = TinyPFN(
         num_features=2,  # 1 feature + bias
         d_model=64,
         n_heads=4,
